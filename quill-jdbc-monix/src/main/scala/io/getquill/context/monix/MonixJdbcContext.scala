@@ -2,18 +2,21 @@ package io.getquill.context.monix
 
 import java.io.Closeable
 import java.sql.{ Array => _, _ }
-
 import io.getquill.NamingStrategy
 import io.getquill.context.StreamingContext
 import io.getquill.context.jdbc.JdbcContextBase
 import io.getquill.context.sql.idiom.SqlIdiom
 import io.getquill.util.ContextLogger
 import javax.sql.DataSource
-import monix.eval.Task
+import monix.eval.{ Task, TaskLift }
 import monix.execution.misc.Local
 import monix.reactive.Observable
-
 import scala.util.Try
+
+import cats.effect.{ Bracket, ExitCase }
+import cats.effect.syntax.bracket._
+
+import scala.language.higherKinds
 
 /**
  * Quill context that wraps all JDBC calls in `monix.eval.Task`.
@@ -57,6 +60,14 @@ abstract class MonixJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
 
   override def close(): Unit = dataSource.close()
 
+  private def setConnectionIn[F[_], A, E](f: Connection => F[A])(c: Connection)(
+    implicit
+    br: Bracket[F, Throwable], tl: TaskLift[F]
+  ): F[A] = {
+    tl.taskLift(wrap(currentConnection.update(Some(c))))
+      .bracket(_ => f(c))(_ => tl.taskLift(wrap(currentConnection.update(None))))
+  }
+
   override protected def withConnection[T](f: Connection => Task[T]): Task[T] =
     for {
       maybeConnection <- wrap { currentConnection() }
@@ -64,7 +75,8 @@ abstract class MonixJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
         case Some(connection) => f(connection)
         case None =>
           schedule {
-            wrap(dataSource.getConnection).bracket(f)(conn => wrapClose(conn.close()))
+            wrap(dataSource.getConnection)
+              .bracket(setConnectionIn(f))(conn => wrapClose(conn.close()))
           }
       }
     } yield result
@@ -77,7 +89,7 @@ abstract class MonixJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
           withAutocommitBracket(connection, f)
         case None =>
           Observable.eval(dataSource.getConnection)
-            .bracket(conn => withAutocommitBracket(conn, f))(conn => wrapClose(conn.close()))
+            .bracket(conn => withAutocommitBracket(conn, setConnectionIn(f)))(conn => wrapClose(conn.close()))
       }
     } yield result
 
@@ -106,25 +118,19 @@ abstract class MonixJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
     wrapClose(conn.setAutoCommit(wasAutocommit))
   }
 
-  def transaction[A](f: Task[A]): Task[A] = {
+  def transaction[A](f: Task[A]): Task[A] = Task.defer {
     val dbEffects = for {
       result <- currentConnection() match {
         case Some(_) => f // Already in a transaction
         case None =>
           wrap(dataSource.getConnection).bracket { conn =>
-            withAutocommitBracket(conn, conn => {
-              wrap(conn).flatMap { conn =>
-                currentConnection.update(Some(conn))
-                f.onCancelRaiseError(new IllegalStateException(
-                  "The task was cancelled in the middle of a transaction."
-                )).doOnFinish {
-                  case Some(error) =>
-                    conn.rollback()
-                    Task.raiseError(error)
-                  case None =>
-                    wrap(conn.commit())
-                }
-              }
+            withAutocommitBracket(conn, {
+              setConnectionIn(conn => f.guaranteeCase {
+                case ExitCase.Completed =>
+                  wrap(conn.commit())
+                case _ =>
+                  wrap(conn.rollback())
+              })
             })
           } { conn =>
             wrap(currentConnection.update(None))
