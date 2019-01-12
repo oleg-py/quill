@@ -313,7 +313,7 @@ def updateWebsiteTag =
 
 lazy val commonSettings = ReleasePlugin.extraReleaseCommands ++ Seq(
   organization := "io.getquill",
-  scalaVersion := "2.11.12",
+  scalaVersion := "2.12.7",
   crossScalaVersions := Seq("2.11.12","2.12.7"),
   libraryDependencies ++= Seq(
     "org.scalamacros" %% "resetallattrs"  % "1.0.0",
